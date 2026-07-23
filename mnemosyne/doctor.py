@@ -1011,11 +1011,17 @@ def _degradation_notes(payload: dict[str, Any]) -> list[str]:
 def _fsync_directory(directory: Path) -> None:
     """Durably sync a completed output replacement's parent directory."""
 
-    descriptor = os.open(directory, os.O_RDONLY)
+    if os.name == "nt":
+        return
+
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
