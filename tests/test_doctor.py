@@ -1029,25 +1029,36 @@ def test_atomic_two_target_failures_restore_existing_artifacts_and_clean_staging
 
     if failure == "replace":
         real_replace = os.replace
-
+    
         def fail_second_replace(source, destination):
             if Path(destination) == markdown_path:
                 raise OSError(error)
             return real_replace(source, destination)
-
+    
         monkeypatch.setattr(doctor.os, "replace", fail_second_replace)
-    else:
+    elif failure == "file_fsync":
         real_fsync = os.fsync
-
-        def fail_selected_fsync(descriptor):
+    
+        def fail_file_fsync(descriptor):
             is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
-            if (failure == "file_fsync" and not is_directory) or (
-                failure == "directory_fsync" and is_directory
-            ):
+            if not is_directory:
                 raise OSError(error)
             return real_fsync(descriptor)
+    
+        monkeypatch.setattr(doctor.os, "fsync", fail_file_fsync)
+    elif failure == "directory_fsync":
+        if os.name == "nt":
+            pytest.skip("Directory fsync is bypassed on Windows, cannot simulate failure")
 
-        monkeypatch.setattr(doctor.os, "fsync", fail_selected_fsync)
+        real_fsync = os.fsync
+    
+        def fail_dir_fsync(descriptor):
+            is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            if is_directory:
+                raise OSError(error)
+            return real_fsync(descriptor)
+    
+        monkeypatch.setattr(doctor.os, "fsync", fail_dir_fsync)
 
     with pytest.raises(OSError, match=error):
         write_doctor_artifacts_atomically(
