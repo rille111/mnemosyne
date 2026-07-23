@@ -435,7 +435,7 @@ class MnemosyneConfig:
                     seed_data[key] = default_val
 
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._config_path, "w") as f:
+            with open(self._config_path, "w", encoding="utf-8") as f:
                 f.write("# Mnemosyne config — edit freely, hot-reload with `mnemosyne config reload`\n")
                 f.write("# Precedence: config.yaml > env vars > hardcoded defaults\n")
                 f.write("# Values below reflect your current env vars where set, otherwise defaults.\n")
@@ -507,7 +507,7 @@ class MnemosyneConfig:
                 if mtime == self._yaml_mtime and self._yaml_cache:
                     return  # unchanged
                 import yaml
-                with open(self._config_path, "r") as f:
+                with open(self._config_path, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f) or {}
                 # Flatten nested YAML into dot-separated keys, but most
                 # Mnemosyne config is flat key: value. Support both.
