@@ -14,6 +14,7 @@ a standalone plugin deployed through the plugin system.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -129,6 +130,8 @@ from mnemosyne.hermes_config import read_hermes_config_key
 from mnemosyne.integrations.hermes_persona_prompt import HermesPersonaPromptMixin
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_MIGRATION_CLAIM_TTL_SECONDS = 300.0
 
 # ---------------------------------------------------------------------------
 # C13: provider-active flag for memory-context double-injection prevention.
@@ -1893,6 +1896,163 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         return "default"
 
+    def _migrate_legacy_builtin_memories(self) -> None:
+        """Import pre-provider MEMORY.md and USER.md entries exactly once.
+
+        A durable per-entry ledger prevents deleted memories from being
+        resurrected and provides an atomic claim so concurrent Hermes sessions
+        cannot import the same entry twice. A stale pending claim is retried
+        after five minutes; the global-memory recheck closes the crash window
+        between storing an entry and marking its ledger row complete.
+        """
+        if not self._beam or not self._hermes_home:
+            return
+
+        conn = getattr(self._beam, "conn", None)
+        if conn is None:
+            logger.warning("Mnemosyne skipped legacy built-in memory migration: no database connection")
+            return
+
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hermes_builtin_memory_imports (
+                    fingerprint TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    claim_token TEXT,
+                    claimed_at REAL,
+                    completed_at REAL
+                )
+                """
+            )
+            conn.commit()
+        except Exception as exc:
+            logger.warning(
+                "Mnemosyne could not initialize the legacy memory migration ledger: %s",
+                type(exc).__name__,
+            )
+            return
+
+        memory_dir = Path(self._hermes_home) / "memories"
+        specs = (
+            (memory_dir / "MEMORY.md", "memory", 0.7),
+            (memory_dir / "USER.md", "user", 0.85),
+        )
+        imported = 0
+        failed = 0
+
+        for path, target, importance in specs:
+            if not path.is_file():
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError):
+                failed += 1
+                logger.warning("Mnemosyne could not read legacy built-in memory file: %s", path)
+                continue
+
+            raw = chr(10).join(raw.splitlines())
+            source = f"builtin_memory_{target}"
+            entries = [entry.strip() for entry in raw.split("\n§\n") if entry.strip()]
+            for content in entries:
+                fingerprint = hashlib.sha256(f"{source}\0{content}".encode()).hexdigest()
+                claim_token = uuid.uuid4().hex
+                now = time.time()
+                claimed = False
+                try:
+                    with conn:
+                        cursor = conn.execute(
+                            "INSERT OR IGNORE INTO hermes_builtin_memory_imports "
+                            "(fingerprint, source, status, claim_token, claimed_at) "
+                            "VALUES (?, ?, 'pending', ?, ?)",
+                            (fingerprint, source, claim_token, now),
+                        )
+                        claimed = cursor.rowcount == 1
+                        if not claimed:
+                            ledger_row = conn.execute(
+                                "SELECT status FROM hermes_builtin_memory_imports "
+                                "WHERE fingerprint = ?",
+                                (fingerprint,),
+                            ).fetchone()
+                            if ledger_row and ledger_row[0] == "complete":
+                                continue
+
+                            exists = conn.execute(
+                                "SELECT 1 FROM working_memory "
+                                "WHERE content = ? AND source = ? AND scope = 'global' LIMIT 1",
+                                (content, source),
+                            ).fetchone()
+                            if exists:
+                                conn.execute(
+                                    "UPDATE hermes_builtin_memory_imports "
+                                    "SET status = 'complete', completed_at = ?, claim_token = NULL "
+                                    "WHERE fingerprint = ?",
+                                    (now, fingerprint),
+                                )
+                                continue
+
+                            cursor = conn.execute(
+                                "UPDATE hermes_builtin_memory_imports "
+                                "SET claim_token = ?, claimed_at = ? "
+                                "WHERE fingerprint = ? AND status = 'pending' "
+                                "AND claimed_at < ?",
+                                (
+                                    claim_token,
+                                    now,
+                                    fingerprint,
+                                    now - _LEGACY_MIGRATION_CLAIM_TTL_SECONDS,
+                                ),
+                            )
+                            claimed = cursor.rowcount == 1
+                    if not claimed:
+                        continue
+
+                    exists = conn.execute(
+                        "SELECT 1 FROM working_memory "
+                        "WHERE content = ? AND source = ? AND scope = 'global' LIMIT 1",
+                        (content, source),
+                    ).fetchone()
+                    if not exists:
+                        self._beam.remember(
+                            content=content,
+                            source=source,
+                            importance=importance,
+                            scope="global",
+                            veracity="imported",
+                            metadata={"migration": "hermes_builtin_v1", "target": target},
+                        )
+                        imported += 1
+
+                    with conn:
+                        conn.execute(
+                            "UPDATE hermes_builtin_memory_imports "
+                            "SET status = 'complete', completed_at = ?, claim_token = NULL "
+                            "WHERE fingerprint = ? AND claim_token = ?",
+                            (time.time(), fingerprint, claim_token),
+                        )
+                except Exception as exc:
+                    try:
+                        with conn:
+                            conn.execute(
+                                "DELETE FROM hermes_builtin_memory_imports "
+                                "WHERE fingerprint = ? AND status = 'pending' AND claim_token = ?",
+                                (fingerprint, claim_token),
+                            )
+                    except Exception:
+                        pass
+                    failed += 1
+                    logger.warning(
+                        "Mnemosyne failed to migrate one legacy %s entry: %s",
+                        path.name,
+                        type(exc).__name__,
+                    )
+
+        if imported:
+            logger.info("Mnemosyne migrated %d legacy built-in memory entries", imported)
+        if failed:
+            logger.warning("Mnemosyne legacy built-in memory migration had %d failure(s)", failed)
+
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
         # C27: clear stale state from any prior init attempt so a re-init
@@ -1997,6 +2157,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # becomes redundant -- but until then it's the conservative
         # choice (codex review #1).
         if self._beam is not None:
+            self._migrate_legacy_builtin_memories()
             # Core BeamMemory.sleep() performs model-refresh auto-apply without
             # direct access to Hermes provider state. Attach the provider's
             # runtime identity so sleep writes canonical model facts into the
@@ -3742,12 +3903,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not self._beam or action not in ("add", "replace"):
             return
         try:
-            scope = "global" if target == "user" else "session"
             self._beam.remember(
                 content=content,
                 source=f"builtin_memory_{target}",
                 importance=0.7 if target == "user" else 0.5,
-                scope=scope,
+                scope="global",
             )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)
